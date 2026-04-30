@@ -14,8 +14,6 @@ from pathlib import Path
 # ==========================================
 # 1. セキュリティ & 外部連携設定
 # ==========================================
-# 【修正】バケツ名を小文字にして試してください。もしダメなら大文字に戻します。
-# ほとんどのSupabase環境では小文字の "images" が正解です。
 BUCKET_NAME = "images" 
 
 @st.cache_resource
@@ -41,15 +39,45 @@ if not supabase:
     st.error("Supabaseの設定が未完了です。")
     st.stop()
 
+# 師範の指示テンプレート
+BASE_SYSTEM_PROMPT = """あなたは温厚な書道師範「清風」です。
+画像全体を[縦1000, 横1000]の方眼として捉え、筆跡の真上に赤ペンを置いてください。
+【重要】
+- 座標[y, x]は、墨が乗っている箇所の「中心」を正確に指してください。
+- 座標が左上に固まらないよう、画像全体の比率を考慮して位置を特定すること。
+必ず以下のJSON形式でのみ回答：
+{
+"grade": "〇級 または 〇段",
+"overall_comment": "素晴らしい点と総評",
+"corrections": [{"point": [y, x], "label": "修正点", "description": "指導内容"}]
+}"""
+
 # ==========================================
-# 2. 画像処理エンジン
+# 2. 画像処理 & データ取得 (キャッシュ対応)
 # ==========================================
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_history(_client: Client):
+    try:
+        response = _client.table("calligraphy_history").select("*").order("written_date", desc=True).execute()
+        return response.data
+    except Exception as e:
+        st.error(f"履歴の取得に失敗しました: {e}")
+        return []
+
+@st.cache_data(show_spinner=False)
+def fetch_image_content(url):
+    try:
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status()
+        return resp.content
+    except Exception: return None
 
 def load_and_fix_image(uploaded_file):
     if uploaded_file is None: return None
     img = Image.open(uploaded_file)
     img = ImageOps.exif_transpose(img)
-    img.thumbnail((1024, 1024))
+    img.thumbnail((1200, 1200))
     return img
 
 def upload_image_to_supabase(img, filename):
@@ -57,16 +85,17 @@ def upload_image_to_supabase(img, filename):
     img.save(img_byte_arr, format='PNG')
     path = f"{filename}.png"
     try:
-        # アップロード実行
         supabase.storage.from_(BUCKET_NAME).upload(
             path, img_byte_arr.getvalue(), {"content-type": "image/png", "x-upsert": "true"}
         )
-        # URLを「手動」で構築して確実性を高める（ここがポイント）
-        # get_public_urlが不安定な場合があるため
-        sb_url = st.secrets.get("SUPABASE_URL").replace(".supabase.co", ".supabase.co/storage/v1/object/public")
-        return f"{sb_url}/{BUCKET_NAME}/{path}"
+        # 公開URLを取得（最新のsupabase-pyの仕様に合わせた取得方法）
+        res = supabase.storage.from_(BUCKET_NAME).get_public_url(path)
+        # 戻り値が文字列の場合とオブジェクトの場合の両方に対応
+        url = res if isinstance(res, str) else res.get('publicURL', res)
+        if hasattr(url, 'public_url'): url = url.public_url
+        return str(url)
     except Exception as e:
-        st.error(f"蔵への保存に失敗しました（バケツ名 {BUCKET_NAME}）: {e}")
+        st.error(f"蔵への保存失敗: {e}")
         return None
 
 def draw_red_pen(base_image, corrections):
@@ -92,17 +121,20 @@ def draw_red_pen(base_image, corrections):
             point = corr.get("point")
             if not isinstance(point, (list, tuple)) or len(point) < 2: continue
             py, px = (float(point[0]) / 1000) * h, (float(point[1]) / 1000) * w
-            r = max(22, w / 42)
+            
+            r = max(25, w / 40)
             draw.ellipse([px-r, py-r, px+r, py+r], outline="red", width=max(4, int(w/150)))
+            draw.ellipse([px-r+7, py-r+7, px+r-7, py+r-7], outline="red", width=1)
+            
             label = corr.get("label", f"点{i+1}")
             txt_bbox = draw.textbbox((px + r + 5, py - r), label, font=font)
-            draw.rectangle(txt_bbox, fill="white", outline="red")
+            draw.rectangle([txt_bbox[0]-5, txt_bbox[1]-2, txt_bbox[2]+5, txt_bbox[3]+2], fill="white", outline="red", width=1)
             draw.text((px + r + 5, py - r), label, fill="red", font=font)
-        except: continue
+        except Exception: continue
     return canvas
 
 # ==========================================
-# 3. メインUI (Tab 1)
+# 3. メインUI
 # ==========================================
 st.set_page_config(page_title="AI書道師範・清風", layout="wide")
 tab1, tab2 = st.tabs(["🖌️ 師範の鑑定", "📈 成長ログ"])
@@ -123,10 +155,10 @@ with tab1:
         if st.button("清風師範に見ていただく", type="primary"):
             with st.spinner("鑑定中..."):
                 try:
-                    # 指導内容をGeminiに依頼
+                    # 404エラー回避のため、確実な 1.5-flash を指名
                     model = genai.GenerativeModel(
-                        model_name='gemini-2.0-flash', # 最新の2.0-flashに更新
-                        system_instruction=f"画像サイズ:{w_px}x{h_px} 座標[y,x] 厳格に添削しJSONで回答せよ。判定は必ず〇級/〇段とせよ。",
+                        model_name='gemini-1.5-flash',
+                        system_instruction=f"画像サイズ:{w_px}x{h_px} \n" + BASE_SYSTEM_PROMPT,
                         generation_config={"response_mime_type": "application/json"}
                     )
                     content_list = []
@@ -137,7 +169,6 @@ with tab1:
                     response = model.generate_content(content_list)
                     data = json.loads(response.text)
 
-                    # クラウド保存
                     eid = str(uuid.uuid4())
                     p_url = upload_image_to_supabase(p_img_obj, f"{eid}_p")
                     m_url = upload_image_to_supabase(m_img_obj, f"{eid}_m") if m_img_obj else None
@@ -161,44 +192,47 @@ with tab1:
             st.success(f"## 判定: {res['grade']}")
             st.info(res['overall_comment'])
             st.image(draw_red_pen(st.session_state.last_img, res['corrections']), use_container_width=True)
+            for c in (res.get('corrections') or []):
+                with st.expander(f"✨ {c.get('label')}", expanded=True):
+                    st.write(c.get('description'))
 
-# ==========================================
-# 4. メインUI (Tab 2)
-# ==========================================
 with tab2:
     st.title("📈 成長ログ")
-    try:
-        # キャッシュされた関数がない場合は直接取得してテスト
-        h_data = supabase.table("calligraphy_history").select("*").order("written_date", desc=True).execute().data
-        if h_data:
-            for h in h_data:
-                with st.container():
-                    st.divider()
-                    c1, c2, c3 = st.columns([2, 1, 1])
-                    with c1: st.subheader(f"📅 {h['written_date']} | 判定: {h['grade']}")
-                    with c3:
-                        if st.checkbox("削除確定", key=f"c_{h['id']}"):
-                            if st.button("🗑️ 削除", key=f"d_{h['id']}"):
-                                supabase.table("calligraphy_history").delete().eq("id", h['id']).execute()
-                                st.cache_data.clear(); st.rerun()
+    history = fetch_history(supabase)
+    if history:
+        for h in history:
+            eid = h['id']
+            with st.container():
+                st.divider()
+                c1, c2, c3 = st.columns([2, 1, 1])
+                with c1: st.subheader(f"📅 {h['written_date']} | 判定: {h['grade']}")
+                with c3:
+                    if st.checkbox("削除確定", key=f"c_{eid}"):
+                        if st.button("🗑️ 削除", key=f"d_{eid}"):
+                            try: supabase.storage.from_(BUCKET_NAME).remove([f"{eid}_p.png", f"{eid}_m.png"])
+                            except: pass
+                            supabase.table("calligraphy_history").delete().eq("id", eid).execute()
+                            st.cache_data.clear(); st.rerun()
 
-                    show_red = st.toggle("アドバイスを表示", value=True, key=f"t_{h['id']}")
-                    col_m, col_p = st.columns(2)
-                    with col_m:
-                        if h['m_url']:
-                            st.image(h['m_url'], caption="お手本", use_container_width=True)
-                    with col_p:
-                        if h['p_url']:
-                            if show_red:
+                show_red = st.toggle("アドバイスを表示", value=True, key=f"t_{eid}")
+                col_m, col_p = st.columns(2)
+                with col_m:
+                    if h.get('m_url'): st.image(h['m_url'], caption="お手本", use_container_width=True)
+                with col_p:
+                    if h.get('p_url'):
+                        if show_red:
+                            img_data = fetch_image_content(h['p_url'])
+                            if img_data:
                                 try:
-                                    resp = requests.get(h['p_url'], timeout=10)
-                                    img_h = ImageOps.exif_transpose(Image.open(io.BytesIO(resp.content)))
-                                    st.image(draw_red_pen(img_h, h['corrections']), caption="添削", use_container_width=True)
-                                except: st.image(h['p_url'], caption="あなたの作品", use_container_width=True)
-                            else:
-                                st.image(h['p_url'], caption="あなたの作品", use_container_width=True)
-                    st.info(h['comment'])
-                    for c in (h.get('corrections') or []):
-                        with st.expander(f"✨ {c.get('label')}"): st.write(c.get('description'))
-    except Exception as e:
-        st.error(f"履歴の読み込みに失敗しました。設定を確認してください: {e}")
+                                    img_h = ImageOps.exif_transpose(Image.open(io.BytesIO(img_data)))
+                                    st.image(draw_red_pen(img_h, h.get('corrections', [])), caption="添削結果", use_container_width=True)
+                                except Exception:
+                                    st.image(h['p_url'], use_container_width=True)
+                        else:
+                            st.image(h['p_url'], use_container_width=True)
+                st.info(h['comment'])
+                for c in (h.get('corrections') or []):
+                    with st.expander(f"✨ {c.get('label')}"):
+                        st.write(c.get('description'))
+    else:
+        st.write("まだ記録がありません。")
