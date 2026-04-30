@@ -1,0 +1,6 @@
+streamlit
+google-generativeai
+google-api-core
+Pillow
+supabase
+requests
