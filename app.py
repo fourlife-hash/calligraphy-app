@@ -32,32 +32,38 @@ def handle_sidebar_and_genai():
         st.stop()
     genai.configure(api_key=api_key)
 
-handle_sidebar_configs = handle_sidebar_and_genai()
+handle_sidebar_and_genai()
 supabase: Client = get_supabase_client()
 
 if not supabase:
     st.error("Supabaseの設定が未完了です。")
     st.stop()
 
-# 404エラーを二度と出さないための「自動モデル検索」
-def get_available_model():
+# 404を根絶する「執念のモデル選別」
+def get_active_model_name():
     try:
-        models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        # 優先順位: 2.0-flash -> 1.5-flash -> その他
-        for preferred in ['models/gemini-2.0-flash', 'models/gemini-1.5-flash', 'models/gemini-1.5-flash-latest']:
-            if preferred in models:
-                return preferred
-        return models[0] # 何か一つでもあればそれを使う
-    except Exception as e:
-        st.error(f"モデルの取得に失敗しました: {e}")
-        return 'models/gemini-1.5-flash' # 万が一のフォールバック
+        # 今使える全モデルを取得
+        available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        
+        # 2.0系から探し、なければ1.5系、最後はなんでもいいから動くものを
+        targets = ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-1.5-flash-latest']
+        
+        for target in targets:
+            # 名前の前後一致を確認（models/ が付いている場合とない場合の両方に対応）
+            for am in available_models:
+                if target in am:
+                    return am
+        return available_models[0]
+    except Exception:
+        return 'gemini-1.5-flash' # 最終フォールバック
 
 SYSTEM_PROMPT = """あなたは温厚な書道師範「清風」です。
-画像全体を[縦1000, 横1000]の方眼として捉え、筆跡の真上に赤ペンを置いてください。
-【重要】
-- 座標[y, x]は、墨が乗っている箇所の「中心」を正確に指してください。
-- 座標が左上に固まらないよう、全体を俯瞰して位置を特定すること。
-必ず以下のJSON形式でのみ回答：
+画像全体を[縦1000, 横1000]の方眼として正確に捉え、修正箇所の真上に[y, x]座標で赤ペンを置いてください。
+- y: 上端0 〜 下端1000
+- x: 左端0 〜 右端1000
+必ず筆跡の真ん中を指してください。
+
+必ず以下のJSON形式でのみ回答してください：
 {
 "grade": "〇級 または 〇段",
 "overall_comment": "素晴らしい点と総評",
@@ -65,7 +71,7 @@ SYSTEM_PROMPT = """あなたは温厚な書道師範「清風」です。
 }"""
 
 # ==========================================
-# 2. 画像 & 通信
+# 2. 画像 & ネットワーク
 # ==========================================
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -73,8 +79,7 @@ def fetch_history(_client: Client):
     try:
         response = _client.table("calligraphy_history").select("*").order("written_date", desc=True).execute()
         return response.data
-    except Exception as e:
-        return []
+    except: return []
 
 @st.cache_data(show_spinner=False)
 def fetch_image_content(url):
@@ -98,12 +103,12 @@ def upload_image_to_supabase(img, filename):
         supabase.storage.from_(BUCKET_NAME).upload(
             path, img_byte_arr.getvalue(), {"content-type": "image/png", "x-upsert": "true"}
         )
-        # URLを確実に取得
+        # URL取得をより堅牢に
         res = supabase.storage.from_(BUCKET_NAME).get_public_url(path)
-        # 文字列かオブジェクトかにかかわらずURLを抽出
+        # 戻り値がオブジェクトか文字列か判定してURLを抽出
+        if isinstance(res, str): return res
         if hasattr(res, 'public_url'): return res.public_url
-        if isinstance(res, dict): return res.get('publicURL')
-        return res
+        return res.get('publicURL')
     except Exception as e:
         st.error(f"保存失敗: {e}")
         return None
@@ -113,10 +118,12 @@ def draw_red_pen(base_image, corrections):
     canvas = base_image.copy()
     draw = ImageDraw.Draw(canvas)
     w, h = canvas.size
+    
     font = None
-    font_size = max(26, int(w / 32))
+    font_size = max(26, int(w / 35))
     current_dir = Path(__file__).parent
     font_candidates = [current_dir / "ipaexm.ttf", current_dir / "NotoSansJP-Regular.ttf", Path("msmincho.ttc")]
+    
     for f_path in font_candidates:
         try:
             font = ImageFont.truetype(str(f_path), font_size)
@@ -129,7 +136,8 @@ def draw_red_pen(base_image, corrections):
             p = corr.get("point")
             if not isinstance(p, (list, tuple)) or len(p) < 2: continue
             py, px = (float(p[0]) / 1000) * h, (float(p[1]) / 1000) * w
-            r = max(25, w / 40)
+            
+            r = max(25, w / 45)
             draw.ellipse([px-r, py-r, px+r, py+r], outline="red", width=max(4, int(w/150)))
             label = corr.get("label", f"点{i+1}")
             txt_bbox = draw.textbbox((px + r + 5, py - r), label, font=font)
@@ -146,6 +154,7 @@ tab1, tab2 = st.tabs(["🖌️ 師範の鑑定", "📈 成長ログ"])
 
 with tab1:
     st.title("🖌️ AI書道師範：清風")
+    
     col1, col2 = st.columns(2)
     with col1: model_file = st.file_uploader("お手本", type=["jpg", "png", "jpeg"], key="m")
     with col2:
@@ -155,17 +164,20 @@ with tab1:
     if practice_file:
         p_img = load_and_fix_image(practice_file)
         st.image(p_img, width=300)
+        
         if st.button("清風師範に見ていただく", type="primary"):
-            with st.spinner("鑑定中..."):
+            with st.spinner("現在最も優れたモデルを探して、鑑定中です..."):
                 try:
-                    # 404を絶対に防ぐ：今使える最新モデルを自動取得
-                    active_model = get_available_model()
+                    # 404を回避するために、いま使える名前をリストから取得
+                    active_model = get_active_model_name()
+                    
                     model = genai.GenerativeModel(
                         model_name=active_model,
                         system_instruction=f"画像サイズ:{p_img.size} \n" + SYSTEM_PROMPT,
                         generation_config={"response_mime_type": "application/json"}
                     )
-                    content = ["添削せよ。手本があれば比較せよ。", p_img]
+                    
+                    content = ["添削せよ。手本があれば骨格を比較せよ。", p_img]
                     m_img = load_and_fix_image(model_file)
                     if m_img: content.insert(1, m_img)
                     
@@ -184,9 +196,10 @@ with tab1:
                         }).execute()
                         st.cache_data.clear()
                         st.session_state.last_res, st.session_state.last_img = data, p_img
-                        st.success(f"鑑定完了！（使用モデル: {active_model}）")
-                    else: st.error("クラウド保存失敗")
-                except Exception as e: st.error(f"鑑定失敗: {e}")
+                        st.success(f"鑑定完了！（使用筆: {active_model}）")
+                    else: st.error("蔵への保存に失敗しました。")
+                except Exception as e:
+                    st.error(f"鑑定失敗: {e}")
 
         if 'last_res' in st.session_state:
             res = st.session_state.last_res
@@ -207,6 +220,8 @@ with tab2:
                 with c3:
                     if st.checkbox("削除確定", key=f"c_{eid}"):
                         if st.button("🗑️ 削除", key=f"d_{eid}"):
+                            try: supabase.storage.from_(BUCKET_NAME).remove([f"{eid}_p.png", f"{eid}_m.png"])
+                            except: pass
                             supabase.table("calligraphy_history").delete().eq("id", eid).execute()
                             st.cache_data.clear(); st.rerun()
 
@@ -221,10 +236,12 @@ with tab2:
                             if img_data:
                                 try:
                                     img_h = ImageOps.exif_transpose(Image.open(io.BytesIO(img_data)))
-                                    st.image(draw_red_pen(img_h, h.get('corrections', [])), caption="添削", use_container_width=True)
-                                except: st.image(h['p_url'], caption="作品", use_container_width=True)
+                                    st.image(draw_red_pen(img_h, h.get('corrections', [])), caption="添削結果", use_container_width=True)
+                                except Exception:
+                                    st.image(h['p_url'], use_container_width=True)
                         else:
-                            st.image(h['p_url'], caption="作品", use_container_width=True)
+                            st.image(h['p_url'], use_container_width=True)
                 for c in (h.get('corrections') or []):
                     with st.expander(f"✨ {c.get('label')}"): st.write(c.get('description'))
-    else: st.write("記録がありません。")
+    else:
+        st.write("記録がありません。")
