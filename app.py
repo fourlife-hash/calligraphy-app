@@ -191,7 +191,7 @@ with tab1:
                         supabase.table("calligraphy_history").insert({
                             "id": eid, "written_date": str(written_d),
                             "grade": data.get("grade",""), "comment": data.get("overall_comment",""),
-                            "corrections": data.get("corrections",[]), "p_url": str(p_url), "m_url": m_url
+                            "corrections": data.get("corrections",[]), "p_url": p_url, "m_url": m_url
                         }).execute()
                         st.cache_data.clear()
                         st.session_state.last_res, st.session_state.last_img = data, p_img
