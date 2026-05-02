@@ -52,20 +52,34 @@ if not supabase:
     st.error("Supabaseの設定が未完了です。secrets.tomlを確認してください。")
     st.stop()
 
+# 【究極の対策】404エラーを物理的に回避する動的モデル選別
 def get_working_model_name():
+    """いまこの瞬間に、画像解析ができる最新モデルをGoogleから直接聞き出す"""
     try:
-        available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        for version in ["2.0-flash", "1.5-flash"]:
-            for m in available_models:
-                if version in m: return m
-        return available_models[0]
-    except Exception: return "models/gemini-1.5-flash"
+        # 1. あなたのAPIキーで今使えるモデルの名簿をGoogleから取得
+        models = genai.list_models()
+        available_names = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
+        
+        # 2. 優先キーワード（新しい順）で検索
+        # Google側の「名前のブレ」に左右されないよう、部分一致で探します
+        priorities = ["2.0-flash", "1.5-pro", "1.5-flash"]
+        
+        for p in priorities:
+            for am in available_names:
+                if p in am:
+                    return am
+        
+        # 3. 優先順位に合致するものがなくても、画像解析(generateContent)ができる先頭のモデルを返す
+        return available_names[0]
+    except Exception as e:
+        # 万が一リストすら取得できない場合のみフォールバック
+        return "models/gemini-1.5-flash"
 
-SYSTEM_PROMPT = """あなたは温厚な書道師範「清風（せいふう）」です。
-[縦1000, 横1000]の座標系で筆跡を分析し、優しく添削してください。
+SYSTEM_PROMPT = """あなたは温厚で丁寧な書道師範「清風（せいふう）」です。
+画像内の筆跡をミリ単位で分析し、優しく添削してください。
 【座標ルール】
 - 座標[y, x]は、指摘したい筆跡の開始点や先端をピンポイントで指してください。
-- 複数の指摘箇所が全く同じ位置に重ならないよう、数ユニットずらして指定すると親切です。
+- 複数の指摘箇所が全く同じ位置に重ならないよう、数ユニットずらして指定してください。
 必ず以下のJSON形式でのみ回答してください：
 {
 "grade": "〇級 または 〇段",
@@ -103,7 +117,6 @@ def load_and_fix_image(uploaded_file):
 
 def upload_image_to_supabase(img, filename):
     img_byte_arr = io.BytesIO()
-    # 【改善】画質を90に上げ、ノイズを抑制
     img.save(img_byte_arr, format='JPEG', quality=90)
     path = f"{filename}.jpg"
     try:
@@ -111,7 +124,9 @@ def upload_image_to_supabase(img, filename):
             path, img_byte_arr.getvalue(), {"content-type": "image/jpeg", "x-upsert": "true"}
         )
         res = supabase.storage.from_(BUCKET_NAME).get_public_url(path)
-        return res if isinstance(res, str) else getattr(res, 'public_url', str(res))
+        # URLを文字列として確実に取得
+        if isinstance(res, str): return res
+        return getattr(res, 'public_url', str(res))
     except Exception as e:
         st.error(f"蔵への保存失敗: {e}")
         return None
@@ -123,7 +138,7 @@ def draw_red_pen(base_image, corrections):
     w, h = canvas.size
     
     font = None
-    font_size = max(26, int(w / 32))
+    font_size = max(26, int(w / 35))
     current_dir = Path(__file__).parent
     font_candidates = [current_dir / "ipaexm.ttf", current_dir / "NotoSansJP-Regular.ttf", Path("msmincho.ttc")]
     for f_path in font_candidates:
@@ -133,26 +148,21 @@ def draw_red_pen(base_image, corrections):
         except Exception: continue
     if not font: font = ImageFont.load_default()
 
-    # 重なり防止用の座標記録
     drawn_positions = []
-
     for i, corr in enumerate(corrections or []):
         try:
             p = corr.get("point")
             if not isinstance(p, (list, tuple)) or len(p) < 2: continue
             py, px = (float(p[0]) / 1000) * h, (float(p[1]) / 1000) * w
             
-            # 【改善】座標が近すぎる場合のラベル位置ずらし（重なり防止）
             offset_y = 0
             for prev_y, prev_x in drawn_positions:
                 if abs(py + offset_y - prev_y) < font_size and abs(px - prev_x) < 200:
-                    offset_y += font_size + 10 # 下にずらす
+                    offset_y += font_size + 10
             
             drawn_positions.append((py + offset_y, px))
-
             r = max(22, w / 42)
             draw.ellipse([px-r, py-r, px+r, py+r], outline="red", width=max(4, int(w/150)))
-            
             label = corr.get("label", f"点{i+1}")
             txt_pos = (px + r + 5, py - r + offset_y)
             txt_bbox = draw.textbbox(txt_pos, label, font=font)
@@ -168,6 +178,7 @@ tab1, tab2 = st.tabs(["🖌️ 師範の鑑定", "📈 成長ログ"])
 
 with tab1:
     st.title("🖌️ AI書道師範：清風")
+    
     col1, col2 = st.columns(2)
     with col1: model_file = st.file_uploader("お手本", type=["jpg", "png", "jpeg"], key="mu")
     with col2:
@@ -179,14 +190,17 @@ with tab1:
         st.image(p_img_obj, width=300)
         
         if st.button("清風師範に見ていただく", type="primary"):
-            with st.spinner("せいふう師範が鑑定中です..."):
+            with st.spinner("道場でいま一番輝いている筆（モデル）を選んでいます..."):
                 try:
+                    # 【重要】404を回避するために、Googleの名簿からその場で最新モデルを特定
                     active_model = get_working_model_name()
+                    
                     model = genai.GenerativeModel(
                         model_name=active_model,
                         system_instruction=f"画像サイズ:{p_img_obj.size} \n" + SYSTEM_PROMPT,
                         generation_config={"response_mime_type": "application/json", "temperature": 0.0}
                     )
+                    
                     content_list = []
                     m_img_obj = load_and_fix_image(model_file)
                     if m_img_obj: content_list.extend(["お手本画像:", m_img_obj])
@@ -196,7 +210,7 @@ with tab1:
                     json_match = re.search(r'\{.*\}', response.text, re.S)
                     
                     if not json_match:
-                        st.error("師範の回答を読み取れませんでした。")
+                        st.error("師範の回答を読み取れませんでした。もう一度お願いします。")
                     else:
                         data = json.loads(json_match.group())
                         eid = str(uuid.uuid4())
@@ -211,7 +225,8 @@ with tab1:
                             }).execute()
                             st.session_state.history_version = str(uuid.uuid4())
                             st.session_state.last_res, st.session_state.last_img = data, p_img_obj
-                            st.success("鑑定完了！蔵に大切に保管しました。")
+                            st.success(f"鑑定完了！蔵に納めました。（使用筆: {active_model}）")
+                        else: st.error("蔵への保存に失敗しました。")
                 except Exception as e: st.error(f"鑑定失敗: {e}")
 
         if st.session_state.last_res:
@@ -224,7 +239,7 @@ with tab1:
                     st.write(c.get('description'))
 
 # ==========================================
-# 5. メインUI (Tab 2: ログ)
+# 5. メインUI (Tab 2: 成長ログ)
 # ==========================================
 with tab2:
     st.title("📈 成長ログ")
@@ -239,7 +254,6 @@ with tab2:
                 with c3:
                     if st.checkbox("削除確定", key=f"c_{eid}"):
                         if st.button("🗑️ 削除", key=f"d_{eid}"):
-                            # 【改善】新旧両方の拡張子を掃除対象にする
                             old_new_paths = [f"{eid}_p.jpg", f"{eid}_m.jpg", f"{eid}_p.png", f"{eid}_m.png"]
                             try: supabase.storage.from_(BUCKET_NAME).remove(old_new_paths)
                             except: pass
