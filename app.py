@@ -13,9 +13,70 @@ from pathlib import Path
 import re
 
 # ==========================================
-# 1. アプリ初期化 (最上部)
+# 1. 空間演出 (Custom CSS)
+# ==========================================
+def apply_zen_style():
+    st.markdown("""
+    <style>
+    /* 全体の背景色：静かな生成り色 */
+    .stApp {
+        background-color: #f8f1e7;
+        background-image: radial-gradient(#e5d8c1 1px, transparent 1px);
+        background-size: 20px 20px;
+    }
+    
+    /* タイトル：毛筆を意識したデザイン */
+    h1 {
+        font-family: "Hiragino Mincho ProN", "Yu Mincho", serif;
+        color: #2c2c2c;
+        border-bottom: 2px solid #8b4513;
+        padding-bottom: 10px;
+        text-align: center;
+    }
+
+    /* サイドバー：使い込まれた木の机 */
+    [data-testid="stSidebar"] {
+        background-color: #3e2723;
+        color: #ffffff;
+    }
+    [data-testid="stSidebar"] h1, [data-testid="stSidebar"] p {
+        color: #d7ccc8;
+    }
+
+    /* 鑑定結果の枠：和紙の質感 */
+    .zen-box {
+        background-color: #ffffff;
+        border: 1px solid #dcdcdc;
+        padding: 25px;
+        border-radius: 5px;
+        box-shadow: 5px 5px 15px rgba(0,0,0,0.05);
+        border-left: 10px solid #8b4513;
+        margin-bottom: 20px;
+    }
+
+    /* 師範の言葉：墨の色 */
+    .master-text {
+        font-family: "Hiragino Mincho ProN", "Yu Mincho", serif;
+        color: #1a1a1a;
+        line-height: 1.8;
+        font-size: 1.1rem;
+    }
+
+    /* タブの見た目 */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 20px;
+        background-color: rgba(255,255,255,0.5);
+        border-radius: 10px;
+        padding: 5px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+# ==========================================
+# 2. 初期化 & セキュリティ
 # ==========================================
 st.set_page_config(page_title="AI書道師範・清風", layout="wide")
+apply_zen_style()
 
 if 'history_version' not in st.session_state:
     st.session_state.history_version = str(uuid.uuid4())
@@ -26,9 +87,6 @@ if 'last_img' not in st.session_state:
 
 BUCKET_NAME = "images"
 
-# ==========================================
-# 2. セキュリティ & 外部連携初期化
-# ==========================================
 @st.cache_resource
 def get_supabase_client():
     sb_url = st.secrets.get("SUPABASE_URL")
@@ -37,11 +95,11 @@ def get_supabase_client():
     return create_client(sb_url, sb_key)
 
 def handle_sidebar_and_genai():
-    st.sidebar.title("道場の設定")
-    user_api_key = st.sidebar.text_input("ご自身のGoogle API Keyを入力してください", type="password")
+    st.sidebar.markdown("### ⛩️ 道場の設え")
+    user_api_key = st.sidebar.text_input("秘伝の鍵 (Google API Key)", type="password")
     api_key = user_api_key if user_api_key else st.secrets.get("GOOGLE_API_KEY")
     if not api_key:
-        st.info("左側のサイドバーに API Key を入力してください。")
+        st.info("左側のサイドバーに API Key を入力し、道場へお入りください。")
         st.stop()
     genai.configure(api_key=api_key)
 
@@ -49,44 +107,24 @@ handle_sidebar_and_genai()
 supabase: Client = get_supabase_client()
 
 if not supabase:
-    st.error("Supabaseの設定が未完了です。secrets.tomlを確認してください。")
+    st.error("蔵(Supabase)の設定が整っておりません。")
     st.stop()
 
-# 【真・究極の対策】2.5-flashを最優先に、最新モデルを動的に取得
 def get_working_model_name():
-    """あなたのAPIキーで利用可能な『最新かつ画像対応』のモデル名を自動特定する"""
     try:
         available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        
-        # 探索キーワード（最新から順に）
-        # 2.5-flashを最優先に設定しました
-        priorities = ["2.5-flash", "2.0-flash", "1.5-pro", "1.5-flash"]
-        
-        for p in priorities:
-            for am in available_models:
-                if p in am:
-                    return am
-        
-        # 該当がなければ画像対応モデルの先頭
+        for version in ["2.5-flash", "2.0-flash", "1.5-flash"]:
+            for m in available_models:
+                if version in m: return m
         return available_models[0]
-    except Exception:
-        # 万が一のフォールバック
-        return "models/gemini-1.5-flash"
+    except Exception: return "models/gemini-1.5-flash"
 
 SYSTEM_PROMPT = """あなたは温厚で丁寧な書道師範「清風（せいふう）」です。
-[縦1000, 横1000]の座標系で、画像内の筆跡をミリ単位で分析し、優しく添削してください。
-【任務】
-1. 具体的鑑定: 結体、筆致、配置、運筆を分析してください。
-2. お手本比較: お手本がある場合、骨格の差を優しく教えてください。
-3. 判定: 日本の書道教室に基づき「〇級」または「〇段」を決定してください。
-
-【座標ルール】
-- 座標[y, x]は、指摘したい筆跡の開始点や筆先をピンポイントで指定してください。
-
+[縦1000, 横1000]の座標系で筆跡を詳しく分析し、優しく添削してください。
 必ず以下のJSON形式でのみ回答してください：
 {
 "grade": "〇級 または 〇段",
-"overall_comment": "素晴らしい点と総評",
+"overall_comment": "素晴らしい点と、各項目の得点根拠を含めた総評",
 "corrections": [{"point": [y, x], "label": "修正箇所", "description": "具体的アドバイス"}]
 }"""
 
@@ -127,7 +165,6 @@ def upload_image_to_supabase(img, filename):
             path, img_byte_arr.getvalue(), {"content-type": "image/jpeg", "x-upsert": "true"}
         )
         res = supabase.storage.from_(BUCKET_NAME).get_public_url(path)
-        # URLを確実に文字列で取得
         if isinstance(res, str): return res
         if hasattr(res, 'public_url'): return str(res.public_url)
         return str(res)
@@ -140,7 +177,6 @@ def draw_red_pen(base_image, corrections):
     canvas = base_image.copy()
     draw = ImageDraw.Draw(canvas)
     w, h = canvas.size
-    
     font = None
     font_size = max(26, int(w / 35))
     current_dir = Path(__file__).parent
@@ -178,44 +214,44 @@ def draw_red_pen(base_image, corrections):
 # ==========================================
 # 4. メインUI (Tab 1: 鑑定)
 # ==========================================
-tab1, tab2 = st.tabs(["🖌️ 師範の鑑定", "📈 成長ログ"])
+st.write("### 🕯️ 静寂の中に、墨の香りを。")
+tab1, tab2 = st.tabs(["🖌️ 師範の鑑定", "📈 成長の歩み"])
 
 with tab1:
-    st.title("🖌️ AI書道師範：清風")
+    st.markdown('<div class="master-text">「さあ、落ち着いて一筆。あなたの心を表す作品をお見せください。」</div>', unsafe_allow_html=True)
     
     col1, col2 = st.columns(2)
-    with col1: model_file = st.file_uploader("お手本", type=["jpg", "png", "jpeg"], key="mu")
+    with col1:
+        st.markdown("#### 📜 お手本を置く")
+        model_file = st.file_uploader("手本の画像をアップロード", type=["jpg", "png", "jpeg"], key="zen_m")
     with col2:
-        practice_file = st.file_uploader("作品（必須）", type=["jpg", "png", "jpeg"], key="pu")
-        written_d = st.date_input("書いた日", datetime.now())
+        st.markdown("#### 🖌️ 清書を置く")
+        practice_file = st.file_uploader("あなたの作品をアップロード", type=["jpg", "png", "jpeg"], key="zen_p")
+        written_d = st.date_input("執筆の日", datetime.now())
 
     if practice_file:
         p_img_obj = load_and_fix_image(practice_file)
-        st.image(p_img_obj, width=300)
-        
+        st.markdown("---")
+        st.image(p_img_obj, caption="本日の作品", width=400)
+
         if st.button("清風師範に見ていただく", type="primary"):
-            with st.spinner("最新の筆（2.5 Flash等）を選び、心を込めて鑑定中..."):
+            with st.spinner("心を落ち着かせ、作品と対話しております..."):
                 try:
-                    # 動的に最適な最新モデルを取得
                     active_model = get_working_model_name()
-                    
                     model = genai.GenerativeModel(
                         model_name=active_model,
                         system_instruction=f"画像サイズ:{p_img_obj.size} \n" + SYSTEM_PROMPT,
                         generation_config={"response_mime_type": "application/json", "temperature": 0.0}
                     )
-                    
                     content_list = []
                     m_img = load_and_fix_image(model_file)
                     if m_img: content_list.extend(["お手本:", m_img])
-                    content_list.extend(["作品:", p_img_obj])
+                    content_list.extend(["生徒の作品:", p_img_obj])
                     
                     response = model.generate_content(content_list)
-                    
                     json_match = re.search(r'\{.*\}', response.text, re.S)
-                    if not json_match:
-                        st.error("師範の回答を読み取れませんでした。もう一度お願いします。")
-                    else:
+                    
+                    if json_match:
                         data = json.loads(json_match.group())
                         eid = str(uuid.uuid4())
                         p_url = upload_image_to_supabase(p_img_obj, f"{eid}_p")
@@ -229,22 +265,24 @@ with tab1:
                             }).execute()
                             st.session_state.history_version = str(uuid.uuid4())
                             st.session_state.last_res, st.session_state.last_img = data, p_img_obj
-                            st.success(f"鑑定完了！（使用モデル: {active_model}）")
-                        else: st.error("蔵への保存に失敗しました。")
-                except Exception as e:
-                    st.error(f"鑑定失敗: {e}")
+                            st.success("鑑定が整いました。蔵に大切に納めます。")
+                    else:
+                        st.error("師範が考え込んでしまったようです。もう一度お願いできますか？")
+                except Exception as e: st.error(f"鑑定失敗: {e}")
 
         if st.session_state.last_res:
             res = st.session_state.last_res
-            st.success(f"## 判定: {res['grade']}")
-            st.info(res['overall_comment'])
+            st.markdown(f'<div class="zen-box"><h3>判定：{res["grade"]}</h3><div class="master-text">{res["overall_comment"]}</div></div>', unsafe_allow_html=True)
             st.image(draw_red_pen(st.session_state.last_img, res['corrections']), use_container_width=True)
             for c in (res.get('corrections') or []):
                 with st.expander(f"✨ {c.get('label')}", expanded=True):
                     st.write(c.get('description'))
 
+# ==========================================
+# 5. メインUI (Tab 2: ログ)
+# ==========================================
 with tab2:
-    st.title("📈 成長ログ")
+    st.markdown('<div class="master-text">「これまでの歩みを振り返りましょう。一筆ごとの積み重ねが、あなたを形作ります。」</div>', unsafe_allow_html=True)
     history = fetch_history(supabase, st.session_state.history_version)
     if history:
         for h in history:
@@ -252,20 +290,20 @@ with tab2:
             with st.container():
                 st.divider()
                 c1, c2, c3 = st.columns([2, 1, 1])
-                with c1: st.subheader(f"📅 {h['written_date']} | 判定: {h['grade']}")
+                with c1: st.subheader(f"📅 {h['written_date']} | {h['grade']}")
                 with c3:
-                    if st.checkbox("削除確定", key=f"c_{eid}"):
-                        if st.button("🗑️ 削除", key=f"d_{eid}"):
+                    if st.checkbox("削除の覚悟", key=f"c_{eid}"):
+                        if st.button("🗑️ 蔵から出す", key=f"d_{eid}"):
                             try: supabase.storage.from_(BUCKET_NAME).remove([f"{eid}_p.jpg", f"{eid}_m.jpg", f"{eid}_p.png", f"{eid}_m.png"])
                             except: pass
                             supabase.table("calligraphy_history").delete().eq("id", eid).execute()
                             st.session_state.history_version = str(uuid.uuid4())
                             st.rerun()
 
-                show_red = st.toggle("アドバイスを表示", value=True, key=f"t_{eid}")
+                show_red = st.toggle("師範のアドバイスを重ねる", value=True, key=f"t_{eid}")
                 col_m, col_p = st.columns(2)
                 with col_m:
-                    if h.get('m_url'): st.image(str(h['m_url']), caption="お手本", use_container_width=True)
+                    if h.get('m_url'): st.image(str(h['m_url']), caption="目指した手本", use_container_width=True)
                 with col_p:
                     if h.get('p_url'):
                         p_url_str = str(h['p_url'])
@@ -274,13 +312,14 @@ with tab2:
                             if img_data:
                                 try:
                                     img_h = ImageOps.exif_transpose(Image.open(io.BytesIO(img_data)))
-                                    st.image(draw_red_pen(img_h, h.get('corrections', [])), caption="添削結果", use_container_width=True)
+                                    st.image(draw_red_pen(img_h, h.get('corrections', [])), caption="添削の跡", use_container_width=True)
                                 except Exception: st.image(p_url_str, use_container_width=True)
                         else:
-                            st.image(p_url_str, use_container_width=True)
-                st.info(h['comment'])
+                            st.image(p_url_str, caption="あなたの筆跡", use_container_width=True)
+                
+                st.markdown(f'<div class="zen-box"><div class="master-text">{h["comment"]}</div></div>', unsafe_allow_html=True)
                 for c in (h.get('corrections') or []):
                     with st.expander(f"✨ {c.get('label')}"):
                         st.write(c.get('description'))
     else:
-        st.write("まだ記録がありません。一枚書いてみませんか？")
+        st.write("まだ蔵に作品がありません。")
