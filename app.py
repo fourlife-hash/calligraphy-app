@@ -13,11 +13,10 @@ from pathlib import Path
 import re
 
 # ==========================================
-# 1. アプリ初期化
+# 1. アプリ初期化 (最上部)
 # ==========================================
 st.set_page_config(page_title="AI書道師範・清風", layout="wide")
 
-# セッション状態の初期化
 if 'history_version' not in st.session_state:
     st.session_state.history_version = str(uuid.uuid4())
 if 'last_res' not in st.session_state:
@@ -53,40 +52,41 @@ if not supabase:
     st.error("Supabaseの設定が未完了です。secrets.tomlを確認してください。")
     st.stop()
 
-# 【究極の対策】404エラーを物理的に回避する動的モデル選別
+# 【真・究極の対策】2.5-flashを最優先に、最新モデルを動的に取得
 def get_working_model_name():
-    """いまこの瞬間に、そのAPIキーで利用可能な最新モデルをGoogleから直接取得する"""
+    """あなたのAPIキーで利用可能な『最新かつ画像対応』のモデル名を自動特定する"""
     try:
-        # APIキーに紐づく、画像解析(generateContent)が可能なモデル名を取得
         available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
         
-        # 優先順位: 2.0系(最新) -> 1.5系(安定) -> その他
-        # Google側の名称変更(2.0-flash-001等)に左右されないよう部分一致で検索
-        priorities = ["2.0-flash", "1.5-pro", "1.5-flash"]
+        # 探索キーワード（最新から順に）
+        # 2.5-flashを最優先に設定しました
+        priorities = ["2.5-flash", "2.0-flash", "1.5-pro", "1.5-flash"]
         
         for p in priorities:
             for am in available_models:
                 if p in am:
                     return am
         
-        return available_models[0] # 見つからなければ名簿の先頭を返す
-    except Exception as e:
-        return "models/gemini-1.5-flash" # リスト取得失敗時の最終フォールバック
+        # 該当がなければ画像対応モデルの先頭
+        return available_models[0]
+    except Exception:
+        # 万が一のフォールバック
+        return "models/gemini-1.5-flash"
 
 SYSTEM_PROMPT = """あなたは温厚で丁寧な書道師範「清風（せいふう）」です。
 [縦1000, 横1000]の座標系で、画像内の筆跡をミリ単位で分析し、優しく添削してください。
 【任務】
-1. 具体的鑑定: 結体、筆致、配置、運筆の4項目を各25点、計100点満点で採点し、判定してください。
-2. お手本比較: お手本がある場合、骨格の差を優しく具体的に教えてください。
+1. 具体的鑑定: 結体、筆致、配置、運筆を分析してください。
+2. お手本比較: お手本がある場合、骨格の差を優しく教えてください。
 3. 判定: 日本の書道教室に基づき「〇級」または「〇段」を決定してください。
 
 【座標ルール】
-- 座標[y, x]は、文字の中心ではなく、指摘したい筆跡の開始点や筆先をピンポイントで指定してください。
+- 座標[y, x]は、指摘したい筆跡の開始点や筆先をピンポイントで指定してください。
 
-必ず以下のJSON形式でのみ回答してください（説明不要）：
+必ず以下のJSON形式でのみ回答してください：
 {
 "grade": "〇級 または 〇段",
-"overall_comment": "素晴らしい点と、各項目の得点根拠を含めた総評",
+"overall_comment": "素晴らしい点と総評",
 "corrections": [{"point": [y, x], "label": "修正箇所", "description": "具体的アドバイス"}]
 }"""
 
@@ -127,10 +127,9 @@ def upload_image_to_supabase(img, filename):
             path, img_byte_arr.getvalue(), {"content-type": "image/jpeg", "x-upsert": "true"}
         )
         res = supabase.storage.from_(BUCKET_NAME).get_public_url(path)
-        # URLを文字列として確実に取得するロジック（0表示バグ対策）
+        # URLを確実に文字列で取得
         if isinstance(res, str): return res
         if hasattr(res, 'public_url'): return str(res.public_url)
-        if isinstance(res, dict): return str(res.get('publicURL', ''))
         return str(res)
     except Exception as e:
         st.error(f"蔵への保存失敗: {e}")
@@ -185,7 +184,7 @@ with tab1:
     st.title("🖌️ AI書道師範：清風")
     
     col1, col2 = st.columns(2)
-    with col1: model_file = st.file_uploader("お手本（理想）", type=["jpg", "png", "jpeg"], key="mu")
+    with col1: model_file = st.file_uploader("お手本", type=["jpg", "png", "jpeg"], key="mu")
     with col2:
         practice_file = st.file_uploader("作品（必須）", type=["jpg", "png", "jpeg"], key="pu")
         written_d = st.date_input("書いた日", datetime.now())
@@ -195,25 +194,24 @@ with tab1:
         st.image(p_img_obj, width=300)
         
         if st.button("清風師範に見ていただく", type="primary"):
-            with st.spinner("現在お使いのAPIキーで、最高に輝いている筆（モデル）を選んでいます..."):
+            with st.spinner("最新の筆（2.5 Flash等）を選び、心を込めて鑑定中..."):
                 try:
-                    # 404を物理的に回避する：自動で今動く最新モデルを名簿から取得
-                    active_model_name = get_working_model_name()
+                    # 動的に最適な最新モデルを取得
+                    active_model = get_working_model_name()
                     
                     model = genai.GenerativeModel(
-                        model_name=active_model_name,
+                        model_name=active_model,
                         system_instruction=f"画像サイズ:{p_img_obj.size} \n" + SYSTEM_PROMPT,
                         generation_config={"response_mime_type": "application/json", "temperature": 0.0}
                     )
                     
                     content_list = []
                     m_img = load_and_fix_image(model_file)
-                    if m_img: content_list.extend(["お手本画像はこちらです。比較してください。", m_img])
-                    content_list.extend(["こちらが添削する生徒の作品画像です。優しく教えてください。", p_img_obj])
+                    if m_img: content_list.extend(["お手本:", m_img])
+                    content_list.extend(["作品:", p_img_obj])
                     
                     response = model.generate_content(content_list)
                     
-                    # 堅牢なJSON抽出
                     json_match = re.search(r'\{.*\}', response.text, re.S)
                     if not json_match:
                         st.error("師範の回答を読み取れませんでした。もう一度お願いします。")
@@ -231,7 +229,7 @@ with tab1:
                             }).execute()
                             st.session_state.history_version = str(uuid.uuid4())
                             st.session_state.last_res, st.session_state.last_img = data, p_img_obj
-                            st.success(f"鑑定完了！（使用筆: {active_model_name}）")
+                            st.success(f"鑑定完了！（使用モデル: {active_model}）")
                         else: st.error("蔵への保存に失敗しました。")
                 except Exception as e:
                     st.error(f"鑑定失敗: {e}")
@@ -245,9 +243,6 @@ with tab1:
                 with st.expander(f"✨ {c.get('label')}", expanded=True):
                     st.write(c.get('description'))
 
-# ==========================================
-# 5. メインUI (Tab 2: 成長ログ)
-# ==========================================
 with tab2:
     st.title("📈 成長ログ")
     history = fetch_history(supabase, st.session_state.history_version)
@@ -261,8 +256,7 @@ with tab2:
                 with c3:
                     if st.checkbox("削除確定", key=f"c_{eid}"):
                         if st.button("🗑️ 削除", key=f"d_{eid}"):
-                            old_new_paths = [f"{eid}_p.jpg", f"{eid}_m.jpg", f"{eid}_p.png", f"{eid}_m.png"]
-                            try: supabase.storage.from_(BUCKET_NAME).remove(old_new_paths)
+                            try: supabase.storage.from_(BUCKET_NAME).remove([f"{eid}_p.jpg", f"{eid}_m.jpg", f"{eid}_p.png", f"{eid}_m.png"])
                             except: pass
                             supabase.table("calligraphy_history").delete().eq("id", eid).execute()
                             st.session_state.history_version = str(uuid.uuid4())
@@ -271,8 +265,7 @@ with tab2:
                 show_red = st.toggle("アドバイスを表示", value=True, key=f"t_{eid}")
                 col_m, col_p = st.columns(2)
                 with col_m:
-                    if h.get('m_url'):
-                        st.image(str(h['m_url']), caption="お手本", use_container_width=True)
+                    if h.get('m_url'): st.image(str(h['m_url']), caption="お手本", use_container_width=True)
                 with col_p:
                     if h.get('p_url'):
                         p_url_str = str(h['p_url'])
